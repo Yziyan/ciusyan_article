@@ -961,3 +961,581 @@ public class TokenFilter extends AccessControlFilter {
         return filterBean;
     }
 ```
+
+# Shiro案例
+
+
+## 一、准备工作
+
+> “工欲善其事，必先利其器”
+
+### （1）依赖导入
+
+```xml
+<dependencies>
+    <!-- 权限控制 -->
+    <dependency>
+        <groupId>org.apache.shiro</groupId>
+        <artifactId>shiro-spring-boot-web-starter</artifactId>
+        <version>${shiro.version}</version>
+    </dependency>
+</dependencies>
+```
+
+* 除去父模块中所需的基本依赖，本篇文章就导入了 `shiro-spring-boot-web-starter`
+* 我们聚焦在`Shiro`上面
+
+### （2）实体类
+
+* 其中使用了 `lombok`简化实体类
+
+#### ① `User`
+
+```java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class User {
+
+    /**
+     * 用户名
+     */
+    private String username;
+    /**
+     * 密码
+     */
+    private String password;
+}
+```
+
+* 很简单，就是最普通的用户名和密码
+
+#### ② `UserVo`
+
+```java
+@Data
+@AllArgsConstructor
+@NoArgsConstructor
+public class UserVo {
+
+    /**
+     * 用户基本信息
+     */
+    private User user;
+
+    /**
+     * 用户角色
+     */
+    private Set<String> roles;
+
+    /**
+     * 用户权限
+     */
+    private Set<String> permissions;
+
+}
+```
+
+* 用户的信息，最主要的是有用户的角色、用户的权限
+
+### （3）模拟数据库
+
+* 下面的三个方法，会模拟数据库、简单业务
+
+#### ① 模拟三个用户
+
+```java
+/**
+ * 默认有三个用户
+ * @return :用户映射
+ */
+private static Map<String, UserVo> userMap() {
+
+    UserVo userVo1 = new UserVo(
+            new User("zhiyan", "111"),
+            Set.of("admin", "teacher"),
+            Set.of("shiro:creat", "shiro:read", "shiro:update", "shiro:delete"));
+
+    UserVo userVo2 = new UserVo(
+            new User("ciusyan", "222"),
+            Set.of("teacher"),
+            Set.of("shiro:read", "shiro:update"));
+
+    UserVo userVo3 = new UserVo(
+            new User("ZY", "333"),
+            Set.of("normal"),
+            Set.of("shiro:read"));
+
+    return Map.of("zhiyan", userVo1, "ciusyan", userVo2, "ZY", userVo3);
+}
+```
+
+* 也很简单，将用户名作为 `key`，将用户信息存储在 `Map`中
+
+
+
+#### ② 查询用户，并且验证密码
+
+```java
+/**
+ * 查询用户，并且需要验证密码
+ * @param username：用户名
+ * @param password：密码
+ * @return ：用户信息
+ */
+public static UserVo get(String username, String password) {
+    Map<String, UserVo> userMap = userMap();
+    UserVo userVo = userMap.get(username);
+
+    // 密码和用户名都正确
+    if (userVo != null && userVo.getUser().getPassword().equals(password)) {
+        return userVo;
+    } else {
+        return null;
+    }
+}
+```
+
+* 直接将判断用户密码的简单业务，放在这里，方便外面使用
+
+#### ③ 根据用户名获取用户信息
+
+```java
+/**
+ * 根据用户名获取用户信息
+ * @param username：用户名
+ * @return ：用户信息
+ */
+public static UserVo getUser(String username) {
+    if (!StringUtils.hasLength(username)) return null;
+    Map<String, UserVo> userMap = userMap();
+    return userMap.get(username);
+}
+```
+
+* 就是直接将用户名作为 key，去映射用户的Map中获取用户信息
+
+### （4）模拟缓存
+
+```java
+public class Caches {
+
+    /**
+     * 将用户信息，用 Token 缓存在 Map 中
+     */
+    private static final Map<String, UserVo> CACHE_USER;
+
+    static {
+        CACHE_USER = new HashMap<>();
+    }
+
+    /**
+     * 放入缓存
+     * @param key：Token
+     * @param value：用户信息
+     */
+    public static void putToken(String key, UserVo value) {
+        if (!StringUtils.hasLength(key) || value == null) return;
+        CACHE_USER.put(key, value);
+    }
+
+    /**
+     * 取出缓存信息
+     * @param key：Token
+     * @return ：用户信息
+     */
+    public static UserVo getToken(String key) {
+        if (!StringUtils.hasLength(key)) return null;
+        return CACHE_USER.get(key);
+    }
+}
+```
+
+* 直接写完，就是将用户信息，通过 `Token`，映射到`Map`中
+
+
+
+## 二、定制化`Shiro`
+
+* 看到这里，应该没有任何不懂的地方，因为我们的重心是在这一部分
+* 再次申明：这篇案例，也是承接前两篇文章的，如果有什么疑问，不妨先看看前两篇文章
+
+
+
+### （1）校验规则：`Token`
+
+```java
+@Data
+public class Token implements AuthenticationToken {
+    private final String token;
+
+    public Token(String token) { this.token = token; }
+
+    @Override
+    public Object getPrincipal() {
+        return token;
+    }
+
+    @Override
+    public Object getCredentials() {
+        return token;
+    }
+}
+```
+
+* 实现 `AuthenticationToken`接口中的抽象方法即可
+* 就是想要在登录成功后，传入一个`Token`
+* 到后面认证授权的时候，利用这个`Token`取出缓存的用户信息
+* 进而拿到他的角色和权限
+
+
+
+### （2）密码匹配规则：`TokenMatcher`
+
+```java
+public class TokenMatcher implements CredentialsMatcher {
+    @Override
+    public boolean doCredentialsMatch(AuthenticationToken token, AuthenticationInfo info) {
+        // 直接放行即可
+        return true;
+    }
+}
+```
+
+* 当认证时，返回了`account`后，就会来到这里认证密码`Credentials`
+* 而这里为什么要直接放行密码，不去做任何认证，应该不会有疑惑了吧
+
+
+
+### （3）数据源：`TokenRealm`
+
+```java
+public class TokenRealm extends AuthorizingRealm {
+
+    public TokenRealm(CredentialsMatcher credentialsMatcher) {
+        super(credentialsMatcher);
+    }
+
+    /**
+     * 支持的 token 类型
+     * @param token：认证时传入的 token
+     * @return ：是否支持
+     */
+    @Override
+    public boolean supports(AuthenticationToken token) {
+        return token instanceof Token;
+    }
+
+    /**
+     * 授权器
+     */
+    @Override
+    protected AuthorizationInfo doGetAuthorizationInfo(PrincipalCollection principals) {
+        String token = (String) principals.getPrimaryPrincipal();
+        SimpleAuthorizationInfo info = new SimpleAuthorizationInfo();
+
+        // 从缓存中取出用户信息
+        UserVo userInfo = Caches.getToken(token);
+        if (userInfo == null) return info;
+
+        // 添加角色信息
+        Set<String> roles = userInfo.getRoles();
+        if (!CollectionUtils.isEmpty(roles))
+            info.setRoles(roles);
+
+        // 添加权限信息
+        Set<String> permissions = userInfo.getPermissions();
+        if (!CollectionUtils.isEmpty(permissions))
+        info.setStringPermissions(permissions);
+
+        return info;
+    }
+
+    /**
+     * 认证器
+     */
+    @Override
+    protected AuthenticationInfo doGetAuthenticationInfo(AuthenticationToken token) throws AuthenticationException {
+        String tk = ((Token) token).getToken();
+        return new SimpleAuthenticationInfo(tk, tk, getName());
+    }
+}
+```
+
+* 不管是认证、还是授权，都需要来到这个类
+* `认证器：doGetAuthenticationInfo()，supports()`这两个方法我就不多赘述了
+* 因为在上一篇文章中，详细描述了其作用和调用时机
+
+
+
+#### ① 授权器 `doGetAuthorizationInfo()`
+
+* 这个方法，我们还是得提一下
+
+* 当有需要去认证权限的地方，会来到这个方法，加载用户的权限、角色
+* 我们取出去认证时传入的 `token`，去缓存里加载用户信息
+* 进而将用户的角色、权限，添加到`AuthorizationInfo`中
+
+
+
+### （4）过滤器：`TokenFilter`
+
+```java
+public class TokenFilter extends AccessControlFilter {
+
+    public static final String TOKEN_HEADER = "Token";
+
+    @Override
+    protected boolean isAccessAllowed(ServletRequest request, ServletResponse response, Object mappedValue) throws Exception {
+        // 直接返回 false ，在onAccessDenied方法中统一处理
+        return false;
+    }
+
+    @Override
+    protected boolean onAccessDenied(ServletRequest request, ServletResponse response) throws Exception {
+
+        HttpServletRequest httpServletRequest = (HttpServletRequest) request;
+        String token = httpServletRequest.getHeader(TOKEN_HEADER);
+
+        // 验证Token是否存在
+        if (!StringUtils.hasLength(token)) {
+            throw new IllegalArgumentException("没有Token，请登录");
+        }
+
+        // 验证Token是否过期
+        if (Caches.getToken(token) == null) {
+            throw new IllegalArgumentException("Token已过期，请重新登录");
+        }
+
+        // 去认证 [or + 授权]
+        SecurityUtils.getSubject().login(new Token(token));
+
+        return true;
+    }
+}
+```
+
+* 这里有两个方法，我们在上一篇也详细谈到了
+* `isAccessAllowed()`直接返回 **false** ，在`onAccessDenied()`方法中统一处理
+* 首先取出请求头中携带的 `Token`
+* 如果没有携带`token`，说明用户没有登录，让其登录后再访问对应功能
+* 如果用其 `token`取不出缓存的用户信息，说明 `token`有误，或者`token`过期
+* 如果都上面的验证都没有问题，那么去`Shiro`认证`SecurityUtils.getSubject().login(new Token(token))`，并且将其 `token` 传入
+
+* 如果认证成功，返回 **true**，放行到下一链条的调用
+* 如果到达了`controller`，再查看是否需要去鉴权。也就是是否需要去调用`doGetAuthorizationInfo()`方法
+
+
+
+### （5）配置：`ShiroConfig`
+
+```java
+@Configuration
+public class ShiroConfig {
+
+    @Bean
+    public Realm realm() {
+        return new TokenRealm(new TokenMatcher());
+    }
+
+    @Bean
+    public ShiroFilterFactoryBean shiroFilterFactoryBean(Realm realm) {
+        ShiroFilterFactoryBean factoryBean = new ShiroFilterFactoryBean();
+
+        // 设置安全管理器
+        factoryBean.setSecurityManager(new DefaultWebSecurityManager(realm));
+
+        // 设置自定义过滤器
+        Map<String, Filter> filterMap = new HashMap<>();
+        filterMap.put("token", new TokenFilter());
+        factoryBean.setFilters(filterMap);
+
+        // 设置URI映射 [需要有序]
+        Map<String, String> uriMap = new LinkedHashMap<>();
+        // 放行登录的 URI -> 使用自带的匿名过滤器
+        uriMap.put("/shiro/login", "anon");
+        // ... 若还需要添加其他放行接口，继续添加即可
+
+        // 其余的 URI 需要使用自定义的 过滤器 TokenFilter 过滤
+        uriMap.put("/**", "token");
+
+        factoryBean.setFilterChainDefinitionMap(uriMap);
+
+        return factoryBean;
+    }
+
+}
+```
+
+* 我们将刚刚自定义好的类，在这里配置一下，通通告诉`Shiro`
+* 具体的配置类容，请在上一篇文章中查看
+* 我们这里，将登录的接口给放行了，也就是不需要去验证`token`，因为我们登录后才有 `token`
+
+
+
+## 三、网络接口层`Controller`
+
+### （1）login()
+
+```java
+@RestController
+@RequestMapping("/shiro")
+public class ShiroDemoController {
+
+    @PostMapping("/login")
+    public String login(@RequestBody User user) {
+        UserVo userVo = Dbs.get(user.getUsername(), user.getPassword());
+        if (userVo == null) return "用户名或者密码错误";
+
+        String token = UUID.randomUUID().toString();
+        // 通过 token 缓存用户信息
+        Caches.putToken(token, userVo);
+
+        return token;
+    }
+}
+```
+
+* 重点看 `login()`方法即可
+    * 验证用户名和密码，如果没有问题
+    * 生成一串字符串`token`，并且将其作为 `key`，存储用户信息
+    * 最后再将其返回给客户端
+* 其余的都是些测试接口，我们在下面一一描述，并且测试
+    * `@RequiresRoles()`：需要的角色
+    * `@RequiresPermissions()`：需要的权限
+
+* 登录接口测试
+
+
+
+* 登录 **zhiyan**账号
+
+![image-20221018143249643](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/e980899ac31942aabaab274fb9e0bcd1~tplv-k3u1fbpfcp-zoom-1.image)
+
+* zhiyan账户的token：`2d8a9fc7-9472-460b-8794-caac0230ee2f`
+* 登录**ciusyan**账号
+
+![image-20221018145211984](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/0b6ee7c44a4a4751bb700c554eaa5fcf~tplv-k3u1fbpfcp-zoom-1.image)
+
+* ciusyan账户的token：`0de57f13-147a-4369-964c-3c9398894869`
+
+* 登录**ZY**账号
+
+![image-20221018150618393](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/096f698155284c62a75ebcfe21705187~tplv-k3u1fbpfcp-zoom-1.image)
+
+* ZY账户的token：`14107c0d-2968-4d39-8e86-6c3171056fce`
+
+* 注：以上三个账号的 `token`，仅适用于我这次测试案例
+
+### （2）get()
+
+```java
+@GetMapping("/get")
+@RequiresRoles("admin")
+@RequiresPermissions("shiro:read")
+public UserVo get(@RequestParam String username) {
+    if (!StringUtils.hasLength(username)) return null;
+    return Dbs.getUser(username);
+}
+```
+
+* 该方法需要 `[admin] 角色、[shiro:read] 权限`才可访问
+* 使用**zhiyan**账号访问
+
+![image-20221018144739686](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/dc8d4de439af45f1be981a131025b128~tplv-k3u1fbpfcp-zoom-1.image)
+
+* 使用**ciusyan**账号访问
+
+![image-20221018145738934](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/ad3dce37c25042978d31a01367377086~tplv-k3u1fbpfcp-zoom-1.image)
+
+* ciusyan的权限不够，所以访问失败
+* 因为我这是简单案例实现，没有对异常进行拦截
+
+
+
+### （3）adminOrNormal()
+
+```java
+@GetMapping("/adminOrNormal")
+@RequiresRoles(value = {
+        "admin", "normal"
+}, logical = Logical.OR)
+public String adminOrNormal() {
+    return "这个接口需要时 [admin] Or [normal] 角色";
+}
+```
+
+* 需要`[admin] or [normal]`角色才可以访问
+
+* 使用**ciusyan**账号访问
+
+![image-20221018150417352](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/f321549f63784d458544488232309d8d~tplv-k3u1fbpfcp-zoom-1.image)
+
+* 因为 ciusyan 账号既没有[admin]角色，也没有[normal]角色。所以访问失败
+* 使用**ZY**账号访问
+
+![image-20221018150915804](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/f9c13dc3bc9743f1b65ef1fc542df1ad~tplv-k3u1fbpfcp-zoom-1.image)
+
+* ZY账号虽然没有[admin]角色，但是有[normal]角色，所以也能访问成功
+
+
+
+### （4）not()
+
+```java
+@GetMapping("/not")
+public String not() {
+    return "这个接口不需要任何角色和权限";
+}
+```
+
+* 这个接口不需要权限和角色就可以访问，那我们试试
+* 1、请求头没有携带 `token令牌`
+
+![image-20221018151307547](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/2b8971fe9d054a199f545b0166860f71~tplv-k3u1fbpfcp-zoom-1.image)
+
+
+
+* 2、请求头携带的`token令牌是无效的`
+
+![image-20221018151536543](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/8775c0214e0e498ebc3f46f3e3d8cf52~tplv-k3u1fbpfcp-zoom-1.image)
+
+* 上面的两个测试，都是有抛出对应的异常的。只不过我们也是没有做统一异常的拦截
+* 下面我们试试用**zhiyan**账号的有效token
+
+![image-20221018151840191](https://p3-juejin.byteimg.com/tos-cn-i-k3u1fbpfcp/0cdf49658644425f9c824cb8c754ed95~tplv-k3u1fbpfcp-zoom-1.image)
+
+* 可以看到，访问一切正常
+
+
+
+### （5）creat()
+
+```java
+@GetMapping("/creat")
+@RequiresPermissions("shiro:create")
+public String creat() {
+    return "这个接口需要 [shiro:create] 权限";
+}
+```
+
+* 这个接口需要 `[shiro:create]`权限
+* 等待你来测试...
+
+
+
+### （6）deleteAndCreate()
+
+```java
+@GetMapping("/deleteAndCreate")
+@RequiresPermissions(value = {
+        "shiro:delete","shiro:create"
+}, logical = Logical.AND)
+public String deleteAndCreate() {
+    return "这个接口需要 [shiro:delete] And [shiro:create] 权限";
+}
+```
+
+* 这个接口需要`[shiro:delete] And [shiro:create]`两个权限
+* 等待你来测试...
+
